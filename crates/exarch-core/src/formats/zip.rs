@@ -403,14 +403,23 @@ impl<R: Read + Seek> ArchiveFormat for ZipArchive<R> {
         let entry_count = self.inner.len();
 
         for i in 0..entry_count {
-            self.process_entry(
+            if let Err(e) = self.process_entry(
                 i,
                 &mut validator,
                 &dest,
                 &mut report,
                 &mut copy_buffer,
                 &mut dir_cache,
-            )?;
+            ) {
+                return Err(if report.total_items() > 0 {
+                    ExtractionError::PartialExtraction {
+                        source: Box::new(e),
+                        report: std::mem::take(&mut report),
+                    }
+                } else {
+                    e
+                });
+            }
         }
 
         report.duration = start.elapsed();
@@ -1516,8 +1525,9 @@ mod tests {
         // For 400 entries: first=0..100, middle=150..250, last=300..400.
         // An encrypted entry at index 125 is in the gap (100..150) and is missed
         // by is_password_protected sampling, but caught by the per-entry check
-        // in process_entry (line 294 of zip.rs).
-        // Critic correction: use index 125 (NOT 200, which is in the middle window).
+        // in process_entry.
+        // Entries 0..125 are unencrypted and extracted successfully before the
+        // encrypted entry is hit, so the error is wrapped in PartialExtraction.
         let zip_data = create_large_archive_with_encrypted_entry(125);
         let cursor = Cursor::new(zip_data);
         let result = ZipArchive::new(cursor);
@@ -1528,13 +1538,19 @@ mod tests {
                 // Caught by constructor sampling — acceptable
             }
             Ok(mut archive) => {
-                // Missed by sampling — must be caught by per-entry check during extraction
+                // Missed by sampling — must be caught by per-entry check during extraction.
+                // Since entries 0..125 were written first, the error is wrapped in
+                // PartialExtraction. Unwrap one level to check the underlying cause.
                 let temp = TempDir::new().unwrap();
                 let config = SecurityConfig::default();
                 let err = archive.extract(temp.path(), &config).unwrap_err();
+                let source = match err {
+                    ExtractionError::PartialExtraction { source, .. } => *source,
+                    other => other,
+                };
                 assert!(
-                    matches!(err, ExtractionError::SecurityViolation { .. }),
-                    "per-entry check must catch encrypted entry missed by sampling, got: {err:?}"
+                    matches!(source, ExtractionError::SecurityViolation { .. }),
+                    "per-entry check must catch encrypted entry missed by sampling, got: {source:?}"
                 );
             }
             Err(other) => panic!("unexpected error: {other:?}"),
