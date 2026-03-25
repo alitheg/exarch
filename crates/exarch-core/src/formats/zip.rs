@@ -85,6 +85,7 @@
 //! Basic extraction:
 //!
 //! ```no_run
+//! use exarch_core::ExtractionOptions;
 //! use exarch_core::SecurityConfig;
 //! use exarch_core::formats::ZipArchive;
 //! use exarch_core::formats::traits::ArchiveFormat;
@@ -93,7 +94,11 @@
 //!
 //! let file = File::open("archive.zip")?;
 //! let mut archive = ZipArchive::new(file)?;
-//! let report = archive.extract(Path::new("/output"), &SecurityConfig::default())?;
+//! let report = archive.extract(
+//!     Path::new("/output"),
+//!     &SecurityConfig::default(),
+//!     &ExtractionOptions::default(),
+//! )?;
 //! println!("Extracted {} files", report.files_extracted);
 //! # Ok::<(), exarch_core::ExtractionError>(())
 //! ```
@@ -101,6 +106,7 @@
 //! Custom security configuration:
 //!
 //! ```no_run
+//! use exarch_core::ExtractionOptions;
 //! use exarch_core::SecurityConfig;
 //!
 //! let mut config = SecurityConfig::default();
@@ -119,6 +125,7 @@ use std::time::Instant;
 use zip::ZipArchive as ZipReader;
 
 use crate::ExtractionError;
+use crate::ExtractionOptions;
 use crate::ExtractionReport;
 use crate::Result;
 use crate::SecurityConfig;
@@ -154,6 +161,7 @@ use super::traits::ArchiveFormat;
 /// # Examples
 ///
 /// ```no_run
+/// use exarch_core::ExtractionOptions;
 /// use exarch_core::SecurityConfig;
 /// use exarch_core::formats::ZipArchive;
 /// use exarch_core::formats::traits::ArchiveFormat;
@@ -162,7 +170,11 @@ use super::traits::ArchiveFormat;
 ///
 /// let file = File::open("archive.zip")?;
 /// let mut archive = ZipArchive::new(file)?;
-/// let report = archive.extract(Path::new("/output"), &SecurityConfig::default())?;
+/// let report = archive.extract(
+///     Path::new("/output"),
+///     &SecurityConfig::default(),
+///     &ExtractionOptions::default(),
+/// )?;
 /// println!("Extracted {} files", report.files_extracted);
 /// # Ok::<(), exarch_core::ExtractionError>(())
 /// ```
@@ -273,6 +285,7 @@ impl<R: Read + Seek> ZipArchive<R> {
     /// explicitly dropped before calling extraction helpers. For files,
     /// the zip file remains alive through validation and is reused for
     /// data extraction.
+    #[allow(clippy::too_many_arguments)]
     fn process_entry(
         &mut self,
         index: usize,
@@ -281,6 +294,7 @@ impl<R: Read + Seek> ZipArchive<R> {
         report: &mut ExtractionReport,
         copy_buffer: &mut CopyBuffer,
         dir_cache: &mut common::DirCache,
+        skip_duplicates: bool,
     ) -> Result<()> {
         let mut zip_file = self.inner.by_index(index).map_err(|e| {
             if e.to_string().contains("Password required to decrypt file") {
@@ -335,7 +349,7 @@ impl<R: Read + Seek> ZipArchive<R> {
                 Some(dir_cache),
             )?;
             if let ValidatedEntryType::Symlink(safe_symlink) = validated.entry_type {
-                common::create_symlink(&safe_symlink, dest, report, dir_cache)?;
+                common::create_symlink(&safe_symlink, dest, report, dir_cache, skip_duplicates)?;
             }
         } else {
             // File: validate BEFORE writing (security invariant preserved),
@@ -356,6 +370,7 @@ impl<R: Read + Seek> ZipArchive<R> {
                 uncompressed_size,
                 copy_buffer,
                 dir_cache,
+                skip_duplicates,
             )?;
         }
 
@@ -363,6 +378,7 @@ impl<R: Read + Seek> ZipArchive<R> {
     }
 
     /// Extracts a regular file to disk.
+    #[allow(clippy::too_many_arguments)]
     fn extract_file(
         zip_file: &mut zip::read::ZipFile<'_, R>,
         validated: &crate::security::validator::ValidatedEntry,
@@ -371,6 +387,7 @@ impl<R: Read + Seek> ZipArchive<R> {
         file_size: u64,
         copy_buffer: &mut CopyBuffer,
         dir_cache: &mut common::DirCache,
+        skip_duplicates: bool,
     ) -> Result<()> {
         common::extract_file_generic(
             zip_file,
@@ -380,13 +397,20 @@ impl<R: Read + Seek> ZipArchive<R> {
             Some(file_size),
             copy_buffer,
             dir_cache,
+            skip_duplicates,
         )
     }
 }
 
 impl<R: Read + Seek> ArchiveFormat for ZipArchive<R> {
-    fn extract(&mut self, output_dir: &Path, config: &SecurityConfig) -> Result<ExtractionReport> {
+    fn extract(
+        &mut self,
+        output_dir: &Path,
+        config: &SecurityConfig,
+        options: &ExtractionOptions,
+    ) -> Result<ExtractionReport> {
         let start = Instant::now();
+        let skip_duplicates = options.skip_duplicates;
 
         let dest = DestDir::new_or_create(output_dir.to_path_buf())?;
 
@@ -410,6 +434,7 @@ impl<R: Read + Seek> ArchiveFormat for ZipArchive<R> {
                 &mut report,
                 &mut copy_buffer,
                 &mut dir_cache,
+                skip_duplicates,
             ) {
                 return Err(if report.total_items() > 0 {
                     ExtractionError::PartialExtraction {
@@ -538,7 +563,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 0);
         assert_eq!(report.directories_created, 0);
@@ -553,7 +580,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
         assert!(temp.path().join("file.txt").exists());
@@ -575,7 +604,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 3);
     }
@@ -589,7 +620,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
         assert!(temp.path().join("dir1/dir2/file.txt").exists());
@@ -614,7 +647,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
 
@@ -641,7 +676,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
     }
@@ -664,7 +701,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
     }
@@ -685,7 +724,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.directories_created, 1);
         assert!(temp.path().join("mydir").is_dir());
@@ -700,7 +741,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
         assert!(temp.path().join("empty.txt").exists());
@@ -719,7 +762,7 @@ mod tests {
         let mut config = SecurityConfig::default();
         config.max_file_size = 100; // Only allow 100 bytes
 
-        let result = archive.extract(temp.path(), &config);
+        let result = archive.extract(temp.path(), &config, &ExtractionOptions::default());
 
         assert!(result.is_err());
     }
@@ -738,7 +781,7 @@ mod tests {
         let mut config = SecurityConfig::default();
         config.max_file_count = 2; // Only allow 2 files
 
-        let result = archive.extract(temp.path(), &config);
+        let result = archive.extract(temp.path(), &config, &ExtractionOptions::default());
 
         assert!(result.is_err());
     }
@@ -752,7 +795,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let result = archive.extract(temp.path(), &config);
+        let result = archive.extract(temp.path(), &config, &ExtractionOptions::default());
 
         assert!(result.is_err());
         assert!(matches!(
@@ -770,7 +813,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let result = archive.extract(temp.path(), &config);
+        let result = archive.extract(temp.path(), &config, &ExtractionOptions::default());
 
         assert!(result.is_err());
     }
@@ -796,7 +839,7 @@ mod tests {
         let mut config = SecurityConfig::default();
         config.max_compression_ratio = 10.0; // Low threshold for testing
 
-        let result = archive.extract(temp.path(), &config);
+        let result = archive.extract(temp.path(), &config, &ExtractionOptions::default());
 
         // Should fail with ZipBomb error
         assert!(result.is_err());
@@ -821,7 +864,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
 
@@ -849,7 +894,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let _report = archive.extract(temp.path(), &config).unwrap();
+        let _report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         let metadata = std::fs::metadata(temp.path().join("binary")).unwrap();
         let permissions = metadata.permissions();
@@ -877,7 +924,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let _report = archive.extract(temp.path(), &config).unwrap();
+        let _report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         let metadata = std::fs::metadata(temp.path().join("binary")).unwrap();
         let permissions = metadata.permissions();
@@ -905,7 +954,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let _report = archive.extract(temp.path(), &config).unwrap();
+        let _report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         let metadata = std::fs::metadata(temp.path().join("binary")).unwrap();
         let permissions = metadata.permissions();
@@ -952,7 +1003,9 @@ mod tests {
         let mut config = SecurityConfig::default();
         config.allowed.symlinks = true;
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1, "should have 1 regular file");
         assert_eq!(report.symlinks_created, 1, "should have 1 symlink");
@@ -989,7 +1042,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default(); // symlinks disabled by default
 
-        let result = archive.extract(temp.path(), &config);
+        let result = archive.extract(temp.path(), &config, &ExtractionOptions::default());
 
         // Should fail because symlinks are not allowed
         assert!(
@@ -1092,7 +1145,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 2);
     }
@@ -1109,7 +1164,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.bytes_written, 13);
     }
@@ -1123,7 +1180,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         // Duration should be non-zero
         assert!(report.duration.as_nanos() > 0);
@@ -1147,7 +1206,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
         assert_eq!(report.directories_created, 0);
@@ -1169,7 +1230,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 0);
         assert_eq!(report.directories_created, 1);
@@ -1186,7 +1249,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let _report = archive.extract(temp.path(), &config).unwrap();
+        let _report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert!(temp.path().join("a/b/c/file.txt").exists());
         assert!(temp.path().join("a").is_dir());
@@ -1205,7 +1270,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 1);
 
@@ -1236,7 +1303,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 100);
     }
@@ -1254,7 +1323,7 @@ mod tests {
         let mut config = SecurityConfig::default();
         config.max_total_size = 1000; // Total limit 1000 bytes
 
-        let result = archive.extract(temp.path(), &config);
+        let result = archive.extract(temp.path(), &config, &ExtractionOptions::default());
 
         assert!(result.is_err());
     }
@@ -1272,7 +1341,9 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = SecurityConfig::default();
 
-        let report = archive.extract(temp.path(), &config).unwrap();
+        let report = archive
+            .extract(temp.path(), &config, &ExtractionOptions::default())
+            .unwrap();
 
         assert_eq!(report.files_extracted, 3);
         assert!(temp.path().join("file with spaces.txt").exists());
@@ -1382,7 +1453,9 @@ mod tests {
         if let Ok(mut archive) = result {
             let temp = TempDir::new().unwrap();
             let config = SecurityConfig::default();
-            let err = archive.extract(temp.path(), &config).unwrap_err();
+            let err = archive
+                .extract(temp.path(), &config, &ExtractionOptions::default())
+                .unwrap_err();
             assert!(
                 matches!(err, ExtractionError::SecurityViolation { .. }),
                 "expected SecurityViolation for unsupported compression, got: {err:?}"
@@ -1407,7 +1480,9 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let mut config = SecurityConfig::default();
             config.allowed.symlinks = true;
-            let err = archive.extract(temp.path(), &config).unwrap_err();
+            let err = archive
+                .extract(temp.path(), &config, &ExtractionOptions::default())
+                .unwrap_err();
             assert!(
                 matches!(err, ExtractionError::SecurityViolation { ref reason } if reason.contains("symlink target too large")),
                 "expected SecurityViolation(symlink target too large), got: {err:?}"
@@ -1426,7 +1501,9 @@ mod tests {
             let temp = TempDir::new().unwrap();
             let mut config = SecurityConfig::default();
             config.allowed.symlinks = true;
-            let err = archive.extract(temp.path(), &config).unwrap_err();
+            let err = archive
+                .extract(temp.path(), &config, &ExtractionOptions::default())
+                .unwrap_err();
             assert!(
                 matches!(err, ExtractionError::InvalidArchive(ref msg) if msg.contains("UTF-8")),
                 "expected InvalidArchive(UTF-8), got: {err:?}"
@@ -1543,7 +1620,9 @@ mod tests {
                 // PartialExtraction. Unwrap one level to check the underlying cause.
                 let temp = TempDir::new().unwrap();
                 let config = SecurityConfig::default();
-                let err = archive.extract(temp.path(), &config).unwrap_err();
+                let err = archive
+                    .extract(temp.path(), &config, &ExtractionOptions::default())
+                    .unwrap_err();
                 let source = match err {
                     ExtractionError::PartialExtraction { source, .. } => *source,
                     other => other,
@@ -1555,6 +1634,99 @@ mod tests {
             }
             Err(other) => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    /// Build a raw ZIP with two local entries sharing the same path.
+    ///
+    /// The `zip` crate's writer rejects duplicate filenames, so we craft bytes
+    /// manually. Both local file records and both central directory entries are
+    /// included so the archive is spec-valid.
+    #[allow(clippy::cast_possible_truncation)]
+    fn create_raw_duplicate_zip(path: &str, content1: &[u8], content2: &[u8]) -> Vec<u8> {
+        let name_bytes = path.as_bytes();
+        let name_len = name_bytes.len() as u16;
+        let mut buf: Vec<u8> = Vec::new();
+
+        let write_local = |buf: &mut Vec<u8>, content: &[u8]| {
+            let crc = crc32_ieee(content);
+            let size = content.len() as u32;
+            buf.extend_from_slice(b"PK\x03\x04");
+            buf.extend_from_slice(&20u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+            buf.extend_from_slice(&0u16.to_le_bytes()); // stored
+            buf.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            buf.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            buf.extend_from_slice(&crc.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&name_len.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes()); // extra
+            buf.extend_from_slice(name_bytes);
+            buf.extend_from_slice(content);
+        };
+
+        let offset1 = buf.len() as u32;
+        write_local(&mut buf, content1);
+        let offset2 = buf.len() as u32;
+        write_local(&mut buf, content2);
+
+        let write_central = |buf: &mut Vec<u8>, content: &[u8], offset: u32| {
+            let crc = crc32_ieee(content);
+            let size = content.len() as u32;
+            buf.extend_from_slice(b"PK\x01\x02");
+            buf.extend_from_slice(&0x031eu16.to_le_bytes()); // version made: Unix
+            buf.extend_from_slice(&20u16.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes()); // flags
+            buf.extend_from_slice(&0u16.to_le_bytes()); // stored
+            buf.extend_from_slice(&0u16.to_le_bytes()); // mod time
+            buf.extend_from_slice(&0u16.to_le_bytes()); // mod date
+            buf.extend_from_slice(&crc.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&size.to_le_bytes());
+            buf.extend_from_slice(&name_len.to_le_bytes());
+            buf.extend_from_slice(&0u16.to_le_bytes()); // extra
+            buf.extend_from_slice(&0u16.to_le_bytes()); // comment
+            buf.extend_from_slice(&0u16.to_le_bytes()); // disk start
+            buf.extend_from_slice(&0u16.to_le_bytes()); // int attrs
+            buf.extend_from_slice(&(0o100_644u32 << 16).to_le_bytes()); // ext attrs
+            buf.extend_from_slice(&offset.to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+        };
+
+        let central_start = buf.len() as u32;
+        write_central(&mut buf, content1, offset1);
+        write_central(&mut buf, content2, offset2);
+        let central_size = (buf.len() as u32) - central_start;
+
+        buf.extend_from_slice(b"PK\x05\x06");
+        buf.extend_from_slice(&0u16.to_le_bytes()); // disk
+        buf.extend_from_slice(&0u16.to_le_bytes()); // disk w/ cd
+        buf.extend_from_slice(&2u16.to_le_bytes()); // entries on disk
+        buf.extend_from_slice(&2u16.to_le_bytes()); // total entries
+        buf.extend_from_slice(&central_size.to_le_bytes());
+        buf.extend_from_slice(&central_start.to_le_bytes());
+        buf.extend_from_slice(&0u16.to_le_bytes()); // comment len
+        buf
+    }
+
+    #[test]
+    fn test_duplicate_entry_skip_default() {
+        let zip_data = create_raw_duplicate_zip("legit.txt", b"first", b"second");
+        let cursor = Cursor::new(zip_data);
+        let mut archive = ZipArchive::new(cursor).unwrap();
+
+        let temp = TempDir::new().unwrap();
+        let config = SecurityConfig::default();
+        let options = ExtractionOptions::default(); // skip_duplicates = true
+
+        let report = archive.extract(temp.path(), &config, &options).unwrap();
+
+        // zip crate 8.x deduplicates entries at ZipArchive::new(), so the raw
+        // archive with two identical filenames appears as a single entry.
+        // The skip logic is verified by the TAR tests; this test confirms the
+        // ZIP extractor still succeeds without panicking on such archives.
+        assert_eq!(report.files_extracted, 1);
+        assert!(temp.path().join("legit.txt").exists());
     }
 
     #[test]
